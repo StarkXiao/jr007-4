@@ -83,6 +83,8 @@ export interface Comment {
   createdAt: string;
   updatedAt: string;
   author: { uuid: string; nickname: string } | null;
+  /** 作者因短时间高频发言被降权，前端淡化展示 */
+  downweighted?: boolean;
   replies?: Comment[];
   pendingModeration?: boolean;
 }

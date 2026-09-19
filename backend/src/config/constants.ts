@@ -123,6 +123,19 @@ export const DEFAULT_PAGE_SIZE = 20;
 export const COMMENT_EDIT_WINDOW_MS = 10 * 60 * 1000;
 export const COMMENT_MAX_EDITS = 1;
 
+/** 评论树最大深度（顶层为第 1 层），超深的回复自动挂到允许的最深祖先下 */
+export const COMMENT_MAX_DEPTH = 5;
+
+/**
+ * 刷屏降权：窗口内发言超过阈值后，账号进入有时效的降权状态，
+ * 期间其评论排序权重乘以 COMMENT_SPAM_FACTOR。这是软处理——不阻断发言，
+ * 只让刷屏内容在列表里沉底，与硬限流（429）互补。
+ */
+export const COMMENT_SPAM_WINDOW_SECONDS = 10 * 60;
+export const COMMENT_SPAM_THRESHOLD = 5;
+export const COMMENT_SPAM_DOWNWEIGHT_SECONDS = 60 * 60;
+export const COMMENT_SPAM_FACTOR = 0.25;
+
 /** 同一用户对同一条目的确认冷却期 */
 export const CONFIRMATION_COOLDOWN_MS = 30 * 24 * 60 * 60 * 1000;
 

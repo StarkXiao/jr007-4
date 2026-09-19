@@ -2,6 +2,7 @@ import type { CommentStatus } from "@prisma/client";
 import {
   AUDIT_ACTIONS,
   COMMENT_EDIT_WINDOW_MS,
+  COMMENT_MAX_DEPTH,
   COMMENT_MAX_EDITS,
   ERROR_CODES,
 } from "../../config/constants";
@@ -11,9 +12,12 @@ import { AppError } from "../../utils/errors";
 import { parsePagination, pagedResult } from "../../utils/pagination";
 import { checkText } from "../../services/moderation/contentFilter";
 import { adjustCredit, CREDIT_DELTAS } from "../../services/moderation/credit";
+import { getSpeechWeights, recordCommentActivity } from "../../services/moderation/spamWeight";
 import { notify } from "../../services/notify";
 import { recordAudit } from "../../services/audit";
 import { serializeComment } from "../shared/serialize";
+import { buildCommentTree, compareByTrust, computeCommentRank } from "./ranking";
+import type { CommentTreeNode } from "./ranking";
 import { isModerator } from "../../types/auth";
 import type { AuthUser } from "../../types/auth";
 
@@ -47,23 +51,34 @@ export async function listComments(
 
   const pagination = parsePagination(query);
 
-  // 先取顶层评论，再一次性把回复取回来，避免 N+1 查询
-  const [roots, total] = await Promise.all([
-    prisma.comment.findMany({
-      where: { spotId: spot.id, parentId: null, status: "visible" },
-      orderBy: { createdAt: "desc" },
-      skip: pagination.skip,
-      take: pagination.take,
-      include: { user: { select: { uuid: true, nickname: true } } },
-    }),
-    prisma.comment.count({ where: { spotId: spot.id, parentId: null, status: "visible" } }),
-  ]);
-
-  const replies = await prisma.comment.findMany({
-    where: { parentId: { in: roots.map((root) => root.id) }, status: "visible" },
+  // 排序键（信用分 × 发言权重 − 时间衰减）是动态值，数据库排不了，
+  // 因此一次取回该地点全部可见评论，在内存里建树、排序、再对顶层分页。
+  // 单地点评论量级（数百条）下这比递归 CTE 简单得多，也避免逐层 N+1。
+  const comments = await prisma.comment.findMany({
+    where: { spotId: spot.id, status: "visible" },
     orderBy: { createdAt: "asc" },
-    include: { user: { select: { uuid: true, nickname: true } } },
+    include: { user: { select: { uuid: true, nickname: true, creditScore: true } } },
   });
+
+  const authorIds = [...new Set(comments.map((comment) => comment.userId))];
+  const weights = await getSpeechWeights(authorIds);
+  const weightOf = (userId: bigint) => weights.get(userId.toString()) ?? 1;
+
+  const now = new Date();
+  const rankOf = (comment: (typeof comments)[number]) =>
+    computeCommentRank(
+      {
+        createdAt: comment.createdAt,
+        authorCredit: comment.user?.creditScore ?? 0,
+        speechWeight: weightOf(comment.userId),
+      },
+      now,
+    );
+
+  const roots = buildCommentTree(comments);
+  roots.sort((a, b) => compareByTrust(a, b, rankOf));
+
+  const pageRoots = roots.slice(pagination.skip, pagination.skip + pagination.take);
 
   // 作者与审核员能看到自己/待审评论的状态提示
   const pendingOwn = viewer
@@ -79,23 +94,57 @@ export async function listComments(
       })
     : [];
 
-  const grouped = new Map<string, ReturnType<typeof serializeComment>[]>();
-  for (const reply of replies) {
-    const key = reply.parentId!.toString();
-    grouped.set(key, [...(grouped.get(key) ?? []), serializeComment(reply)]);
-  }
+  const serializeNode = (node: CommentTreeNode<(typeof comments)[number]>): Record<string, unknown> => ({
+    ...serializeComment(node.comment),
+    // 刷屏降权的评论仍然展示，只是排序沉底；标记交给前端做淡化处理
+    downweighted: weightOf(node.comment.userId) < 1,
+    replies: node.replies.map(serializeNode),
+  });
 
   return {
-    ...pagedResult(
-      roots.map((root) => ({
-        ...serializeComment(root),
-        replies: grouped.get(root.id.toString()) ?? [],
-      })),
-      total,
-      pagination,
-    ),
+    ...pagedResult(pageRoots.map(serializeNode), roots.length, pagination),
     ownPending: pendingOwn.map(serializeComment),
   };
+}
+
+/**
+ * 解析回复的挂载点。支持多级嵌套，但限制最大深度：
+ * 超深时自动挂到"允许的最深祖先"下，让对话仍然成立而不是直接报错。
+ * 返回挂载的父评论 id 与应通知的作者 id。
+ */
+async function resolveReplyTarget(
+  parentId: bigint,
+  spotId: bigint,
+): Promise<{ parentId: bigint; notifyUserId: bigint }> {
+  const parent = await prisma.comment.findUnique({
+    where: { id: parentId },
+    select: { id: true, spotId: true, parentId: true, userId: true, status: true },
+  });
+  if (!parent || parent.status !== "visible") throw AppError.badRequest("要回复的评论不存在");
+  if (parent.spotId !== spotId) throw AppError.badRequest("回复的评论不属于该地点");
+
+  // 沿父链向上收集祖先，推算父评论所在深度（顶层为第 1 层）
+  const ancestors: { id: bigint; userId: bigint }[] = [];
+  let cursor: { parentId: bigint | null } = parent;
+  while (cursor.parentId !== null && ancestors.length < COMMENT_MAX_DEPTH) {
+    const ancestor: { id: bigint; parentId: bigint | null; userId: bigint } | null =
+      await prisma.comment.findUnique({
+        where: { id: cursor.parentId },
+        select: { id: true, parentId: true, userId: true },
+      });
+    if (!ancestor) break;
+    ancestors.push(ancestor);
+    cursor = ancestor;
+  }
+
+  const parentDepth = ancestors.length + 1;
+  if (parentDepth + 1 <= COMMENT_MAX_DEPTH) {
+    return { parentId: parent.id, notifyUserId: parent.userId };
+  }
+
+  // 挂到深度 COMMENT_MAX_DEPTH - 1 的祖先下，新评论正好落在最大深度
+  const target = ancestors[parentDepth - COMMENT_MAX_DEPTH];
+  return { parentId: target.id, notifyUserId: target.userId };
 }
 
 export async function createComment(
@@ -113,23 +162,9 @@ export async function createComment(
 
   let parentAuthorId: bigint | null = null;
   if (input.parentId !== undefined) {
-    const parent = await prisma.comment.findUnique({
-      where: { id: input.parentId },
-      select: { id: true, spotId: true, parentId: true, userId: true, status: true },
-    });
-    if (!parent || parent.status !== "visible") throw AppError.badRequest("要回复的评论不存在");
-    if (parent.spotId !== spot.id) throw AppError.badRequest("回复的评论不属于该地点");
-    // 只支持两级：对回复再回复时自动挂到顶层评论下
-    if (parent.parentId !== null) {
-      const root = await prisma.comment.findUnique({
-        where: { id: parent.parentId },
-        select: { id: true, userId: true },
-      });
-      input.parentId = root?.id ?? parent.id;
-      parentAuthorId = root?.userId ?? parent.userId;
-    } else {
-      parentAuthorId = parent.userId;
-    }
+    const target = await resolveReplyTarget(input.parentId, spot.id);
+    input.parentId = target.parentId;
+    parentAuthorId = target.notifyUserId;
   }
 
   const since = new Date(Date.now() - 86400000);
@@ -163,6 +198,9 @@ export async function createComment(
     },
     include: { user: { select: { uuid: true, nickname: true } } },
   });
+
+  // 记录发言频率：短时间高频发言的账号会被自动降低排序权重
+  await recordCommentActivity(user.id);
 
   if (parentAuthorId && parentAuthorId !== user.id) {
     await notify({

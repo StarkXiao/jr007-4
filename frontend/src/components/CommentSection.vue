@@ -4,6 +4,7 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import { api } from "@/api/client";
 import type { Comment, Paged } from "@/api/types";
 import { useAuthStore } from "@/stores/auth";
+import CommentItem from "./CommentItem.vue";
 import ReportDialog from "./ReportDialog.vue";
 
 const props = defineProps<{ spotUuid: string }>();
@@ -90,7 +91,8 @@ defineExpose({ reload: load });
 
 <template>
   <div class="comment-section">
-    <h3 style="margin: 0 0 12px; font-size: 16px">大家的补充（{{ total }}）</h3>
+    <h3 style="margin: 0 0 4px; font-size: 16px">大家的补充（{{ total }}）</h3>
+    <p class="muted" style="margin: 0 0 12px; font-size: 12px">按可信度排序，长期活跃的可靠贡献者排前面</p>
 
     <div v-if="auth.isLoggedIn" class="comment-editor">
       <el-input
@@ -131,37 +133,14 @@ defineExpose({ reload: load });
     <div v-loading="loading">
       <el-empty v-if="!loading && items.length === 0" description="还没有人补充，欢迎你来做第一个" />
 
-      <div v-for="comment in items" :key="comment.id" class="comment">
-        <div class="comment__head">
-          <span class="comment__author">{{ comment.author?.nickname ?? "匿名" }}</span>
-          <span class="muted">{{ new Date(comment.createdAt).toLocaleString("zh-CN") }}</span>
-          <el-tag v-if="comment.edited" size="small" type="info">已编辑</el-tag>
-        </div>
-        <div class="comment__body">{{ comment.body }}</div>
-
-        <div class="comment__actions">
-          <el-button v-if="auth.isLoggedIn" text size="small" @click="startReply(comment)">回复</el-button>
-          <el-button
-            v-if="auth.user?.uuid === comment.author?.uuid || auth.isModerator"
-            text
-            size="small"
-            @click="remove(comment)"
-          >
-            删除
-          </el-button>
-          <el-button v-if="auth.isLoggedIn" text size="small" @click="reportTarget = comment.id">举报</el-button>
-        </div>
-
-        <div v-if="comment.replies?.length" class="comment__replies">
-          <div v-for="reply in comment.replies" :key="reply.id" class="comment">
-            <div class="comment__head">
-              <span class="comment__author">{{ reply.author?.nickname ?? "匿名" }}</span>
-              <span class="muted">{{ new Date(reply.createdAt).toLocaleString("zh-CN") }}</span>
-            </div>
-            <div class="comment__body">{{ reply.body }}</div>
-          </div>
-        </div>
-      </div>
+      <CommentItem
+        v-for="comment in items"
+        :key="comment.id"
+        :comment="comment"
+        @reply="startReply"
+        @remove="remove"
+        @report="(id: string) => (reportTarget = id)"
+      />
     </div>
 
     <ReportDialog
@@ -183,12 +162,6 @@ defineExpose({ reload: load });
   justify-content: flex-end;
   gap: 8px;
   margin-top: 8px;
-}
-
-.comment__actions {
-  display: flex;
-  gap: 4px;
-  margin-top: 4px;
 }
 
 .comment-pending {
